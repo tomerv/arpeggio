@@ -59,7 +59,7 @@ def load_yelp(path, max_lines=None, verbose=True):
             if i == num_lines:
                 break
             if verbose and ((i+1) % 100000) == 0:
-                print_flush('Loaded {} ratings...'.format(i+1))
+                print_flush('  Loaded {} ratings...'.format(i+1))
             data = json.loads(line)
             user_id = user2id.get_id(data['user_id'])
             item_id = item2id.get_id(data['business_id'])
@@ -182,52 +182,57 @@ class PredictionModel(object):
         assert reg_lambda >= 0
 
         # Placeholders for input, output and dropout
-        self.input_user_id = tf.placeholder(tf.int32, [None], name="input_user_id")
-        self.input_item_id = tf.placeholder(tf.int32, [None], name="input_item_id")
-        self.input_rating = tf.placeholder(tf.float32, [None], name="input_rating")
-        self.input_topone = tf.placeholder(tf.float32, [None], name="input_topone")
-        self.input_per_user_items = tf.placeholder(tf.int32, [None, None], name="input_per_user_items")
-        self.input_per_user_item_count = tf.placeholder(tf.int32, [None], name="input_per_user_item_count")
+        self.input_user_ids = tf.placeholder(tf.int32, [None], name="input_user_ids")
+        self.input_per_user_count    = tf.placeholder(tf.int32,   [None], name="input_per_user_count")
+        self.input_per_user_item_ids = tf.placeholder(tf.int32,   [None, None], name="input_per_user_item_ids")
+        self.input_per_user_ratings  = tf.placeholder(tf.float32, [None, None], name="input_per_user_ratings")
     
-        batch_size = tf.shape(self.input_user_id)[0]
-        asrt1 = tf.assert_equal(batch_size, tf.shape(self.input_item_id)[0])
-        asrt2 = tf.assert_equal(batch_size, tf.shape(self.input_rating)[0])
-        asrt3 = tf.assert_equal(batch_size, tf.shape(self.input_topone)[0])
-        asrt4 = tf.assert_equal(batch_size, tf.shape(self.input_per_user_items)[0])
-        asrt5 = tf.assert_equal(batch_size, tf.shape(self.input_per_user_item_count)[0])
+        num_users = tf.shape(self.input_user_ids)[0]
+        batch_size = tf.reduce_sum(self.input_per_user_count)
+        asrt1 = tf.assert_equal(num_users, tf.shape(self.input_per_user_count)[0])
+        asrt2 = tf.assert_equal(num_users, tf.shape(self.input_per_user_item_ids)[0])
+        asrt3 = tf.assert_equal(num_users, tf.shape(self.input_per_user_ratings)[0])
+
+        # pu = per_user
+
+        pu_mask = tf.sequence_mask(self.input_per_user_count, dtype=tf.float32)
 
         # embedding lookup layer
-        with tf.device('/cpu:0'), tf.name_scope('embedding_lookup'), tf.control_dependencies([asrt1, asrt2, asrt3, asrt4, asrt5]):
-            user_embedding = embedding_lookup_layer(self.input_user_id, self.num_users, self.embedding_dim, 'user_embedding')
-            item_embedding = embedding_lookup_layer(self.input_item_id, self.num_items, self.embedding_dim, 'item_embedding')
-            item_embedding2 = embedding_lookup_layer(self.input_per_user_items, self.num_items, self.embedding_dim, 'item_embedding', reuse=True)
+        with tf.device('/cpu:0'), tf.name_scope('embedding_lookup'), tf.control_dependencies([asrt1, asrt2, asrt3]):
+            # get dimension of user_ids to match the per_user_* stuff
+            expanded_user_ids = tf.expand_dims(self.input_user_ids, 1)
+            expanded_user_em = embedding_lookup_layer(expanded_user_ids, self.num_users, self.embedding_dim, 'user_embedding')
+            pu_item_em = embedding_lookup_layer(self.input_per_user_item_ids, self.num_items, self.embedding_dim, 'item_embedding')
 
         # PMF part
         with tf.name_scope('pmf'):
-            self.pmf_prediction = tf.sigmoid(tf.reduce_sum(user_embedding * item_embedding, axis=1))
-            self.pmf_loss_batch = 0.5 * tf.reduce_sum(tf.squared_difference(self.input_rating, self.pmf_prediction))
+            self.pmf_prediction = tf.sigmoid(tf.reduce_sum(expanded_user_em * pu_item_em, axis=-1))
+            self.pmf_loss_batch = 0.5 * tf.reduce_sum(pu_mask * tf.squared_difference(self.input_per_user_ratings, self.pmf_prediction))
+            # extrapolate to the whole dataset
             self.pmf_loss = self.pmf_loss_batch / tf.cast(batch_size, tf.float32) * self.num_ratings
+
 
         # ListRank part
         with tf.name_scope('listrank'):
-            mask = tf.sequence_mask(self.input_per_user_item_count, dtype=tf.float32)
-            # calculate topone for the prediction
-            t = tf.expand_dims(user_embedding, 1) * item_embedding2
-            prediction_topone_denom = tf.reduce_sum(mask * tf.exp(tf.sigmoid(tf.reduce_sum(t, axis=-1))))
-            prediction_topone = tf.exp(tf.sigmoid(tf.reduce_sum(user_embedding * item_embedding, axis=-1))) / prediction_topone_denom
-            self.listrank_loss_batch = tf.reduce_sum(-self.input_topone * tf.log(prediction_topone))
+            def pu_topone(tensor):
+                return tf.exp(pu_mask * tensor) / tf.reduce_sum(pu_mask * tf.exp(tensor), axis=-1, keep_dims=True)
+            pu_true_topone      = pu_topone(self.input_per_user_ratings)
+            pu_predicted_topone = pu_topone(self.pmf_prediction)
+            self.listrank_loss_batch = tf.reduce_sum(pu_mask * -pu_true_topone * tf.log(pu_predicted_topone))
+            # extrapolate to the whole dataset
             self.listrank_loss = self.listrank_loss_batch / tf.cast(batch_size, tf.float32) * self.num_ratings
 
         # regularization
         with tf.name_scope('regularization'):
-            # batch_lambda = reg_lambda * tf.cast(batch_size, tf.float32) / tf.cast(self.num_users, tf.float32)
-            # self.reg_loss = batch_lambda / 2 * (tf.reduce_sum(tf.square(user_embedding)) + tf.reduce_sum(tf.square(item_embedding)))
-            self.reg_loss = reg_lambda / 2 * (tf.reduce_sum(tf.square(user_embedding)) + tf.reduce_sum(tf.square(item_embedding)))
+            self.reg_loss = reg_lambda / 2 * sum(tf.get_collection(tf.GraphKeys.REGULARIZATION_LOSSES))
 
         # loss
         with tf.name_scope('loss'):
             self.loss = alpha * self.pmf_loss + (1-alpha) * self.listrank_loss + self.reg_loss
+            # TODO: this doesn't converge with the optimizer...
+            # self.loss = self.listrank_loss
 
+    # TODO
     def get_ranking_predictions(self, user_ids):
         with tf.device('/cpu:0'), tf.name_scope('embedding_lookup'):
             item_ids = np.arange(self.num_items)
@@ -295,17 +300,15 @@ def train(
     # Initialize all variables
     sess.run(tf.global_variables_initializer())
 
-    def train_step(batch_user_id, batch_item_id, batch_rating, batch_topone, batch_pui, batch_puic):
+    def train_step(user_ids, per_user_count, per_user_item_ids, per_user_ratings):
         """
         A single training step 
         """
         feed_dict = {
-            model.input_user_id: batch_user_id,
-            model.input_item_id: batch_item_id,
-            model.input_rating: batch_rating,
-            model.input_topone: batch_topone,
-            model.input_per_user_items: batch_pui,
-            model.input_per_user_item_count: batch_puic,
+            model.input_user_ids:          user_ids,
+            model.input_per_user_count:    per_user_count,
+            model.input_per_user_item_ids: per_user_item_ids,
+            model.input_per_user_ratings:  per_user_ratings,
         }
         sess.run(train_op, feed_dict)
         step, loss, rate = sess.run(
@@ -321,17 +324,15 @@ def train(
             )
         return loss
 
-    def val_step(batch_user_id, batch_item_id, batch_rating, batch_topone, batch_pui, batch_puic, writer=None):
+    def val_step(user_ids, per_user_count, per_user_item_ids, per_user_ratings, writer=None):
         """
         Evaluates model on a val set
         """
         feed_dict = {
-            model.input_user_id: batch_user_id,
-            model.input_item_id: batch_item_id,
-            model.input_rating: batch_rating,
-            model.input_topone: batch_topone,
-            model.input_per_user_items: batch_pui,
-            model.input_per_user_item_count: batch_puic,
+            model.input_user_ids:          user_ids,
+            model.input_per_user_count:    per_user_count,
+            model.input_per_user_item_ids: per_user_item_ids,
+            model.input_per_user_ratings:  per_user_ratings,
         }
         step, summaries, loss = sess.run(
             [global_step, val_summary_op, model.loss],
@@ -347,16 +348,16 @@ def train(
     batches = ratings.train_batch_iter(FLAGS.batch_size, FLAGS.num_epochs)
     last_val_loss = 0
     # Training loop. For each batch...
-    for (batch_user_id, batch_item_id, batch_rating, batch_topone, batch_per_user_items, batch_per_user_item_count) in batches:
-        last_train_loss = train_step(batch_user_id, batch_item_id, batch_rating, batch_topone, batch_per_user_items, batch_per_user_item_count)
+    for (user_ids, per_user_count, per_user_item_ids, per_user_ratings) in batches:
+        last_train_loss = train_step(user_ids, per_user_count, per_user_item_ids, per_user_ratings)
         current_step = tf.train.global_step(sess, global_step)
         if stop_after and current_step > stop_after:
             print_flush('Stopping after {} training steps'.format(stop_after))
             break
         if current_step % FLAGS.evaluate_every == 0:
             print_flush("\nEvaluation:")
-            (val_user_id, val_item_id, val_rating, val_topone, val_per_user_items, val_per_user_item_count) = ratings.get_batch(ratings.val[:1024])
-            last_val_loss = val_step(val_user_id, val_item_id, val_rating, val_topone, val_per_user_items, val_per_user_item_count, writer=val_summary_writer)
+            (val_user_ids, val_per_user_count, val_per_user_item_ids, val_per_user_ratings) = ratings.get_batch(ratings.val[:1024])
+            last_val_loss = val_step(val_user_ids, val_per_user_count, val_per_user_item_ids, val_per_user_ratings, writer=val_summary_writer)
             print_flush("")
         if current_step % FLAGS.checkpoint_every == 0:
             path = saver.save(sess, checkpoint_prefix, global_step=current_step)
@@ -422,7 +423,7 @@ def runall():
                     )
                     for i in range(1):
                         f.write('alpha: {}\n'.format(alpha))
-                        last_loss = train(model, sess, 1e0, 40000, 0.5, FLAGS.training_stop_after)
+                        last_loss = train(model, sess, 1e-1, 40000, 0.5, FLAGS.training_stop_after)
                         f.write('loss: {}\n'.format(last_loss))
                         f.flush()
                         res[alpha]['loss:'].append(last_loss)
