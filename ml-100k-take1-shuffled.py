@@ -38,11 +38,10 @@ def load_ml_100k(path, verbose=True):
     return all_data
 
 data = load_ml_100k('/home/tvromen/research/datasets/ml-100k/u.data')
-# # shuffle order
-# data['timestamp'] = np.random.randint(1000000, size=len(data))
+# shuffle order
+data['timestamp'] = np.random.randint(1000000, size=len(data))
 ratings = RatingsData.RatingsData.from_data(data, p_val=1, p_test=0, take_last=1)
-# ratings = RatingsData.RatingsData.from_data(data, p_val=1, p_test=0, give_first=10)
 
-ratings.output_as_text(ratings.train, 'ml-100k-take1.train.txt')
-ratings.output_as_text(ratings.val, 'ml-100k-take1.val.txt')
+ratings.output_as_text(ratings.train, 'ml-100k-take1-shuffled.train.txt')
+ratings.output_as_text(ratings.val, 'ml-100k-take1-shuffled.val.txt')
 

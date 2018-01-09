@@ -7,24 +7,21 @@ import time
 from collections import defaultdict
 sys.path.append('/home/tvromen/research')
 from Common.Utils import IdAssigner, print_flush
-from Common.RatingsData import RatingsData
+from Common.RatingsData import RatingsData, remove_extreme_users, constant_user_length
 import tensorflow as tf
 import matplotlib.pyplot as plt
+from occf import calc_scores
 
 class Flags(object):
     def __init__(self):
-        # Data loading params
-        self.ratings_file = '/home/tvromen/research/yelp_dataset/review.json' # Data source for the ratings
-        self.max_lines = None
-
         # Model Hyperparameters
         self.embedding_dim = 10
-        self.reg_lambda = 0.1
+        self.reg_lambda = 0.000001
 
         # Training parameters
         self.training_stop_after = None
         self.batch_size = 1024
-        self.num_epochs = 200
+        self.num_epochs = 5000
         self.summary_every = 100
         self.evaluate_every = 1000
         self.checkpoint_every = 2000
@@ -37,77 +34,14 @@ class Flags(object):
 FLAGS = Flags()
 
 
-def load_yelp(path, max_lines=None, verbose=True):
-    if verbose:
-        print_flush('Loading Yelp ratings...')
-    user2id = IdAssigner()
-    item2id = IdAssigner()
-    with open(path) as f:
-        if verbose:
-            print_flush('Scanning file...')
-        for num_lines,_ in enumerate(f, 1):
-            if num_lines == max_lines:
-                break
-        if verbose:
-            print_flush('Will load {} ratings'.format(num_lines))
-        all_data = np.zeros(
-            num_lines,
-            dtype=[('user_id', np.int32), ('item_id', np.int32), ('rating', np.float32), ('timestamp', np.int64)]
-        )
-        f.seek(0)
-        for i,line in enumerate(f):
-            if i == num_lines:
-                break
-            if verbose and ((i+1) % 100000) == 0:
-                print_flush('  Loaded {} ratings...'.format(i+1))
-            data = json.loads(line)
-            user_id = user2id.get_id(data['user_id'])
-            item_id = item2id.get_id(data['business_id'])
-            rating = (data['stars'] - 1) / 4.0
-            # too slow:
-            # timestamp = datetime.strptime(data['date'], '%Y-%m-%d').toordinal()
-            year, month, day = map(int, data['date'].split('-'))
-            timestamp = datetime(year=year, month=month, day=day).toordinal()
-            all_data[i] = (user_id, item_id, rating, timestamp)
-    if verbose:
-        print_flush('Loaded {} ratings'.format(len(all_data)))
-        print_flush('Num users: {}'.format(user2id.get_next_id()))
-        print_flush('Num items: {}'.format(item2id.get_next_id()))
-        ratings = all_data['rating']
-        print_flush('Min/mean/max rating: {}/{:.3}/{}'.format(
-            np.min(ratings), np.mean(ratings), np.max(ratings)
-        ))
-    return all_data
-
 np.random.seed(1234)
 
-FLAGS.max_lines = 500000  #TODO
-yelp_data = load_yelp(FLAGS.ratings_file, FLAGS.max_lines)
 
-def remove_extreme_users(data):
-    counts = np.bincount(data['user_id'])
-    q = [50.0, 90.0, 99.0, 99.9, 99.99, 99.999]
-    percentiles = np.percentile(counts, q, interpolation='nearest')
-    print_flush('Percentiles for number of ratings per user:')
-    for a,b in zip(q, percentiles):
-        print_flush('  {}: {}'.format(a, b))
-    # plt.hist(counts, bins=np.logspace(0., np.log10(np.max(counts)) , 20), normed=1, cumulative=True)
-    # plt.gca().set_xscale("log")
-    # plt.show()
-    max_items_per_user = percentiles[3] + 1  # 99.9%
-    print_flush('Removing all users with just 1 rating, or more than {} ratings'.format(max_items_per_user))
-    too_much   = set(np.flatnonzero(counts > max_items_per_user))
-    too_little = set(np.flatnonzero(counts < 2))
-    bad_user = too_much | too_little
-    print_flush('Removing {} users'.format(len(bad_user)))
-    data = np.array([x for x in data if x['user_id'] not in bad_user])
-    print_flush('Left with {} ratings'.format(len(data)))
-    return data
+###########
+# Dataset #
+###########
 
-yelp_data = remove_extreme_users(yelp_data)
-
-ratings = RatingsData(yelp_data)
-
+ratings = RatingsData.from_files('ml-100k-take1.train.txt', 'ml-100k-take1.val.txt')
 print_flush('Num users: {}'.format(ratings.num_users))
 print_flush('Num items: {}'.format(ratings.num_items))
 
@@ -120,13 +54,6 @@ users_val   = set(ratings.val['user_id'])
 print_flush('# users in train set: {}'.format(len(users_train)))
 print_flush('# users in val set: {}'.format(len(users_val)))
 print_flush('# users in val set not in train set: {}'.format(len(users_val - users_train)))
-
-# print_flush(ratings.train[:10])
-# for i,b in enumerate(ratings.train_batch_iter(10, 1)):
-#     if i == 0:
-#         print_flush(b)
-#     break
-# exit()
 
 
 #############
@@ -207,20 +134,30 @@ class PredictionModel(object):
         # PMF part
         with tf.name_scope('pmf'):
             self.pmf_prediction = tf.sigmoid(tf.reduce_sum(expanded_user_em * pu_item_em, axis=-1))
-            self.pmf_loss_batch = 0.5 * tf.reduce_sum(pu_mask * tf.squared_difference(self.input_per_user_ratings, self.pmf_prediction))
+            self.pmf_loss_batch = 0.5 * tf.reduce_mean(pu_mask * tf.squared_difference(self.input_per_user_ratings, self.pmf_prediction))
             # extrapolate to the whole dataset
-            self.pmf_loss = self.pmf_loss_batch / tf.cast(batch_size, tf.float32) * self.num_ratings
+            # self.pmf_loss = self.pmf_loss_batch / tf.cast(batch_size, tf.float32) * self.num_ratings
+            self.pmf_loss = self.pmf_loss_batch
 
 
-        # ListRank part
+        # ListRank part - TODO: not working well with the optimizer...
         with tf.name_scope('listrank'):
             def pu_topone(tensor):
-                return tf.exp(pu_mask * tensor) / tf.reduce_sum(pu_mask * tf.exp(tensor), axis=-1, keep_dims=True)
+                exp_tensor = tf.exp(tensor)
+                return exp_tensor / tf.reduce_sum(pu_mask * exp_tensor, axis=-1, keep_dims=True)
             pu_true_topone      = pu_topone(self.input_per_user_ratings)
             pu_predicted_topone = pu_topone(self.pmf_prediction)
-            self.listrank_loss_batch = tf.reduce_sum(pu_mask * -pu_true_topone * tf.log(pu_predicted_topone))
+            self.listrank_loss_batch = tf.reduce_mean(pu_mask * -pu_true_topone * tf.log(pu_predicted_topone + 1e-6))
             # extrapolate to the whole dataset
-            self.listrank_loss = self.listrank_loss_batch / tf.cast(batch_size, tf.float32) * self.num_ratings
+            # self.listrank_loss = self.listrank_loss_batch / tf.cast(batch_size, tf.float32) * self.num_ratings
+            self.listrank_loss = self.listrank_loss_batch
+
+        # CLiMF
+        with tf.name_scope('climf'):
+            pu_item_em_diffs = tf.expand_dims(pu_item_em, 1) - tf.expand_dims(pu_item_em, 2)
+            t = tf.sigmoid(tf.reduce_sum(tf.expand_dims(expanded_user_em, 1) * pu_item_em_diffs, axis=-1))
+            s = tf.reduce_sum(tf.log(1 - tf.expand_dims(pu_mask, -1) * t + 1e-6), axis=-1)
+            self.climf_loss = tf.reduce_mean(-pu_mask * (tf.log(self.pmf_prediction) + s))
 
         # regularization
         with tf.name_scope('regularization'):
@@ -228,18 +165,22 @@ class PredictionModel(object):
 
         # loss
         with tf.name_scope('loss'):
-            self.loss = alpha * self.pmf_loss + (1-alpha) * self.listrank_loss + self.reg_loss
+            # TODO:
+            # self.loss = alpha * self.pmf_loss + (1-alpha) * self.listrank_loss + self.reg_loss
+            # self.loss = alpha * self.pmf_loss + (1-alpha) * self.listrank_loss
             # TODO: this doesn't converge with the optimizer...
             # self.loss = self.listrank_loss
+            # self.loss = self.climf_loss
+            # self.loss = alpha * self.pmf_loss + (1-alpha) * self.listrank_loss + self.reg_loss
+            self.loss = self.pmf_loss + self.reg_loss
 
-    # TODO
-    def get_ranking_predictions(self, user_ids):
+    def get_embedding_mats(self):
         with tf.device('/cpu:0'), tf.name_scope('embedding_lookup'):
+            user_ids = np.arange(self.num_users)
             item_ids = np.arange(self.num_items)
-            user_embeddings = embedding_lookup_layer(user_ids, self.num_users, self.embedding_dim, 'user_embedding', reuse=True)
-            item_embeddings = embedding_lookup_layer(item_ids, self.num_items, self.embedding_dim, 'item_embedding', reuse=True)
-            predicitions = tf.matmul(user_embeddings, item_embeddings, transpose_b=True)
-            return predicitions
+            U = embedding_lookup_layer(user_ids, self.num_users, self.embedding_dim, 'user_embedding', reuse=True)
+            V = embedding_lookup_layer(item_ids, self.num_items, self.embedding_dim, 'item_embedding', reuse=True)
+            return (U, V)
 
 
 # Training
@@ -356,8 +297,12 @@ def train(
             break
         if current_step % FLAGS.evaluate_every == 0:
             print_flush("\nEvaluation:")
-            (val_user_ids, val_per_user_count, val_per_user_item_ids, val_per_user_ratings) = ratings.get_batch(ratings.val[:1024])
+            (val_user_ids, val_per_user_count, val_per_user_item_ids, val_per_user_ratings) = ratings.get_batch(ratings.val[:FLAGS.batch_size])
             last_val_loss = val_step(val_user_ids, val_per_user_count, val_per_user_item_ids, val_per_user_ratings, writer=val_summary_writer)
+            U, V = sess.run(model.get_embedding_mats())
+            predictions = np.matmul(U, np.transpose(V))
+            ndcg,mrr = calc_scores.calc_scores(ratings.val, predictions, 10)
+            print_flush(' NDCG@10 and MRR@10 for val set: {:.4f}, {:.4f}'.format(ndcg, mrr))
             print_flush("")
         if current_step % FLAGS.checkpoint_every == 0:
             path = saver.save(sess, checkpoint_prefix, global_step=current_step)
@@ -366,46 +311,12 @@ def train(
     return (last_train_loss, last_val_loss)
 
 
-def calc_precision(sess, model, k):
-    ranks = []
-    precision_at_k = 0
-    mrr_at_k = 0.
-    user_ids = list(set(ratings.val['user_id']))
-    scores = sess.run(model.get_ranking_predictions(user_ids))
-    n = len(ratings.val)
-    print_flush('Calculating precision on {} items'.format(n))
-    for i in range(n):
-        user_id, item_id, rating = ratings.val[i]
-        if i % 1000 == 0:
-            print_flush('{}...'.format(i))
-        s = scores[i][item_id] # the score for the correct item
-        #print_flush(s)
-        train_items = ratings.train[ratings.train['user_id'] == user_id]['item_id']
-        # not_watched = (scores[i] == scores[i]) # all True
-        not_watched = np.ones_like(scores[i], dtype=np.bool)
-        not_watched[train_items] = False
-        higher_scores = (scores[i] > s)    
-        rank = np.sum(higher_scores & not_watched) + 1
-        ranks.append(rank)
-        #print_flush('for user_id {} the rank is {}'.format(user_id, rank))
-        if rank <= k:
-            precision_at_k += 1
-            mrr_at_k += 1. / rank
-    precision_at_k /= n
-    mrr_at_k /= n
-    print_flush('Precision@{} is {}'.format(k, precision_at_k))
-    print_flush('MRR@{} is {}'.format(k, mrr_at_k))
-    # plt.hist(ranks, bins=np.logspace(0., np.log10(ratings.id_assigner.get_next_id()) , 20), normed=1)
-    # plt.gca().set_xscale("log")
-    # plt.show()
-    return precision_at_k, mrr_at_k
-
-
 def runall():
     res = defaultdict(lambda : defaultdict(list))
     with open('results.txt', 'a') as f:
         # for alpha in [0.0, 0.1, 0.2, 0.3, 0.4]:
-        for alpha in [0.0]:
+        # for alpha in [0.0]:
+        for alpha in [1.0]:
             with tf.Graph().as_default():
                 session_conf = tf.ConfigProto(
                     allow_soft_placement=FLAGS.allow_soft_placement,
@@ -423,16 +334,21 @@ def runall():
                     )
                     for i in range(1):
                         f.write('alpha: {}\n'.format(alpha))
-                        last_loss = train(model, sess, 1e-1, 40000, 0.5, FLAGS.training_stop_after)
+                        last_loss = train(model, sess, 1e0, 40000, 0.5, FLAGS.training_stop_after)
                         f.write('loss: {}\n'.format(last_loss))
                         f.flush()
                         res[alpha]['loss:'].append(last_loss)
-                        precision_at_10, mrr_at_10 = calc_precision(sess, model, 10)
-                        f.write(repr((precision_at_10, mrr_at_10)) + '\n')
+                        U, V = sess.run(model.get_embedding_mats())
+                        np.savetxt('ml-100k-take1.pmf.u.txt', U, delimiter=',')
+                        np.savetxt('ml-100k-take1.pmf.v.txt', V, delimiter=',')
+                        predictions = np.matmul(U, np.transpose(V))
+                        ndcg,mrr = calc_scores.calc_scores(ratings.val, predictions, 10)
+                        f.write(repr((ndcg,mrr)) + '\n')
                         f.write('\n')
                         f.flush()
-                        res[alpha]['precision_at_10'].append(precision_at_10)
-                        res[alpha]['mrr_at_10'].append(mrr_at_10)
+                        # res[alpha]['precision_at_10'].append(precision_at_10)
+                        res[alpha]['ndcg_at_10'].append(ndcg)
+                        res[alpha]['mrr_at_10'].append(mrr)
             print_flush(res)
     return res
 

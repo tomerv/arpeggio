@@ -53,21 +53,26 @@ def range_print(n):
             print('  i = {}'.format(i))
         yield i
 
+# Calculate popularity of each item
+# This is too slow:
+# popularity = np.array([np.sum(ratings.train_sparse[:,item_id] > 0) for item_id in range_print(ratings.num_items)])
+# A faster way:
 counts = defaultdict(int)
 for rating in ratings.train:
     counts[rating['item_id']] += 1
 popularity = np.array([counts[i] for i in range(ratings.num_items)])
 
-# popularity = np.array([np.sum(ratings.train_sparse[:,item_id] > 0) for item_id in range_print(ratings.num_items)])
-predictions = np.repeat(popularity[None], ratings.num_users, axis=0)
-ndcg, mrr = calc_scores.calc_scores(ratings.train, predictions, k)
-print('Results on TRAINING set: NDCG@{}={}, MRR@{}={}'.format(k, ndcg, k, mrr))
-ndcg, mrr = calc_scores.calc_scores(ratings.val, predictions, k)
-print('Results on VALIDATION set: NDCG@{}={}, MRR@{}={}'.format(k, ndcg, k, mrr))
+
+numtest = 1000
+testids = np.random.permutation(list(set(ratings.val['user_id'])))[:numtest]
+predictions = np.repeat(popularity[None], numtest, axis=0)
+ndcg, mrr, precision = calc_scores.calc_scores(ratings.train, testids, predictions, k)
+print_flush('Results on TRAINING set: NDCG@{}={}, MRR@{}={}, P@{}={}'.format(k, ndcg, k, mrr, k, precision))
+ndcg, mrr, precision = calc_scores.calc_scores(ratings.val, testids, predictions, k)
+print_flush('Results on VALIDATION set: NDCG@{}={}, MRR@{}={}, P@{}={}'.format(k, ndcg, k, mrr, k, precision))
 
 U = np.ones((ratings.num_users, 1))
 V = popularity[:,None]
-print(V.shape)
-np.savetxt('results/'+dataset_name+'.popularity.u.txt', U, delimiter=',')
-np.savetxt('results/'+dataset_name+'.popularity.v.txt', V, delimiter=',')
+np.savetxt('results-'+dataset_name+'/popularity.u.txt', U, delimiter=',')
+np.savetxt('results-'+dataset_name+'/popularity.v.txt', V, delimiter=',')
 

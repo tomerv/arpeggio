@@ -1,4 +1,11 @@
-# TODO: add imports, etc.
+import sys
+sys.path.append('/home/tvromen/research')
+from Common.Utils import IdAssigner, print_flush
+from Common import RatingsData
+import numpy as np
+import json
+from datetime import datetime
+
 
 def load_yelp(path, max_lines=None, verbose=True):
     if verbose:
@@ -17,6 +24,7 @@ def load_yelp(path, max_lines=None, verbose=True):
             num_lines,
             dtype=[('user_id', np.int32), ('item_id', np.int32), ('rating', np.float32), ('timestamp', np.int64)]
         )
+        unique = set()
         f.seek(0)
         for i,line in enumerate(f):
             if i == num_lines:
@@ -33,6 +41,10 @@ def load_yelp(path, max_lines=None, verbose=True):
             year, month, day = map(int, data['date'].split('-'))
             timestamp = datetime(year=year, month=month, day=day).toordinal()
             all_data[i] = (user_id, item_id, rating, timestamp)
+            t = (user_id, item_id)
+            if t in unique:
+                print_flush('Multiple ratings for user {} on item {}'.format(data['user_id'], data['business_id']))
+            unique.add(t)
     if verbose:
         print_flush('Loaded {} ratings'.format(len(all_data)))
         print_flush('Num users: {}'.format(user2id.get_next_id()))
@@ -43,9 +55,21 @@ def load_yelp(path, max_lines=None, verbose=True):
         ))
     return all_data
 
-# FLAGS.max_lines = 500000  #TODO
-# yelp_data = load_yelp(FLAGS.ratings_file, FLAGS.max_lines)
-# yelp_data = remove_top_percentile(yelp_data)
-# ratings = RatingsData.from_data(yelp_data)
+max_lines = None
+# max_lines = 500000
+yelp_data = load_yelp('/home/tvromen/research/datasets/yelp/review.json', max_lines)
+yelp_data = RatingsData.remove_top_percentile(yelp_data)
 
+# Need to remap user IDs to be sequential
+print_flush('Reassigning user IDs')
+user2id = IdAssigner()
+for i in range(len(yelp_data)):
+    yelp_data[i]['user_id'] = user2id.get_id(yelp_data[i]['user_id'])
+
+np.random.seed(1234)
+ratings = RatingsData.RatingsData.from_data(yelp_data)
+
+ratings.output_as_text(ratings.train, 'yelp-take1.train.txt')
+ratings.output_as_text(ratings.val,   'yelp-take1.val.txt')
+ratings.output_as_text(ratings.test,  'yelp-take1.test.txt')
 

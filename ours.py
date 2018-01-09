@@ -16,6 +16,7 @@ class Flags(object):
     def __init__(self):
         # Model Hyperparameters
         self.embedding_dim = 10
+        self.alpha = 0.1
         self.reg_lambda = 0.000001
 
         # Training parameters
@@ -43,7 +44,7 @@ np.random.seed(1234)
 ###########
 
 if len(sys.argv) != 2:
-    print('Usage: python3 baseline-bpr.py <dataset_name>')
+    print('Usage: python3 ours.py <dataset_name>')
     exit(1)
 
 dataset_name = sys.argv[1]
@@ -115,12 +116,33 @@ def bias_lookup_layer(x, vocab_size, variable_scope, reuse=False):
     x_bias = tf.squeeze(tf.nn.embedding_lookup(b, x), -1)
     return x_bias
 
+def fc_layer(x, output_size, variable_scope, reuse=False):
+    """
+    Fully-connected layer
+    x has shape (batch_size, d_2)
+    result has shape (batch_size, output_size)
+    """
+    shape = get_dynamic_tensor_shape(x)
+    assert len(shape) == 2
+    ## TODO: regularization
+    with tf.variable_scope(variable_scope, reuse=reuse):
+        W = tf.get_variable(
+            "W",
+            shape=[shape[1], output_size],
+            initializer=tf.contrib.layers.xavier_initializer())
+        b = tf.get_variable(
+            "b",
+            shape=[output_size],
+            initializer=tf.contrib.layers.xavier_initializer())
+    result = tf.nn.xw_plus_b(x, W, b, name="fc")
+    return result
+
 class PredictionModel(object):
     """
     A neural network for predicting per-user item ratings.
     The input to the network is the user_id and item_id.
     """
-    def __init__(self, num_users, num_items, num_ratings, embedding_dim, reg_lambda):
+    def __init__(self, num_users, num_items, num_ratings, embedding_dim, alpha, reg_lambda):
 
         assert num_users >= 1
         self.num_users = num_users
@@ -153,8 +175,10 @@ class PredictionModel(object):
         # embedding lookup layer
         with tf.device('/cpu:0'), tf.name_scope('embedding_lookup'), tf.control_dependencies([asrt1, asrt2, asrt3, asrt4]):
             # get dimension of user_ids to match the per_user_* stuff
-            expanded_user_ids = tf.expand_dims(self.input_user_ids, 1)
-            expanded_user_em = embedding_lookup_layer(expanded_user_ids, self.num_users, self.embedding_dim, 'user_embedding')
+            user_em = embedding_lookup_layer(self.input_user_ids, self.num_users, self.embedding_dim, 'user_embedding')
+            user_bias = bias_lookup_layer(self.input_user_ids, self.num_users, 'user_embedding')
+            expanded_user_em = tf.expand_dims(user_em, 1)
+            expanded_user_bias = tf.expand_dims(user_bias, 1)
             pu_item_em = embedding_lookup_layer(self.input_per_user_item_ids, self.num_items, self.embedding_dim, 'item_embedding')
             pu_neg_em  = embedding_lookup_layer(self.input_per_user_neg_ids,  self.num_items, self.embedding_dim, 'item_embedding', reuse=True)
             pu_item_bias = bias_lookup_layer(self.input_per_user_item_ids, self.num_items, 'item_embedding')
@@ -164,7 +188,20 @@ class PredictionModel(object):
             pu_em_delta   = pu_item_em - pu_neg_em
             pu_bias_delta = pu_item_bias - pu_neg_bias
             pu_prediction_delta = tf.reduce_sum(expanded_user_em * pu_em_delta, axis=-1) + pu_bias_delta
-            self.bpr_loss = pu_mask * tf.log(tf.sigmoid(-pu_prediction_delta) + 0.01) # TODO: log?
+            # self.bpr_loss = pu_mask * tf.log(tf.sigmoid(-pu_prediction_delta) + 0.01)
+            self.bpr_loss = pu_mask * tf.sigmoid(-pu_prediction_delta)
+
+        # PMF (a.k.a. "SVD for recommender systems) part
+        with tf.name_scope('rating'):
+            user_rating_em = tf.tanh(fc_layer(user_em, self.embedding_dim, 'ranking_to_rating'))
+            expanded_user_rating_em = tf.expand_dims(user_rating_em, 1)
+            shape = get_dynamic_tensor_shape(pu_item_em)
+            all_item_em = tf.reshape(pu_item_em, (shape[0]*shape[1], shape[2]))
+            all_item_rating_em = tf.tanh(fc_layer(all_item_em, self.embedding_dim, 'ranking_to_rating', reuse=True))
+            pu_item_rating_em = tf.reshape(all_item_rating_em, (shape[0], shape[1], self.embedding_dim))
+            pu_item_rating_bias = bias_lookup_layer(self.input_per_user_item_ids, self.num_items, 'item_rating_embedding')
+            self.rating_prediction = tf.reduce_sum(expanded_user_rating_em * pu_item_rating_em, axis=-1) + expanded_user_bias + pu_item_rating_bias
+            self.rating_loss = tf.square(self.input_per_user_ratings - self.rating_prediction)
 
         # regularization
         with tf.name_scope('regularization'):
@@ -172,7 +209,7 @@ class PredictionModel(object):
 
         # loss
         with tf.name_scope('loss'):
-            self.loss = tf.reduce_mean(self.bpr_loss) + self.reg_loss
+            self.loss = ((1-alpha)*tf.reduce_mean(self.bpr_loss)) + (alpha*tf.reduce_mean(self.rating_loss)) + self.reg_loss 
 
     def get_embedding_mats(self):
         with tf.device('/cpu:0'), tf.name_scope('embedding_lookup'):
@@ -333,6 +370,7 @@ def runall():
                     num_items=ratings.num_items,
                     num_ratings=len(ratings.train),
                     embedding_dim=FLAGS.embedding_dim,
+                    alpha=FLAGS.alpha,
                     reg_lambda=FLAGS.reg_lambda,
                 )
                 for i in range(1):
@@ -341,9 +379,9 @@ def runall():
                     f.flush()
                     res['loss'].append(last_loss)
                     U, V, Vb = sess.run(model.get_embedding_mats())
-                    np.savetxt('results-'+dataset_name+'/bpr.u.txt', U, delimiter=',')
-                    np.savetxt('results-'+dataset_name+'/bpr.v.txt', V, delimiter=',')
-                    np.savetxt('results-'+dataset_name+'/bpr.vb.txt', Vb, delimiter=',')
+                    np.savetxt('results-'+dataset_name+'/ours.u.txt', U, delimiter=',')
+                    np.savetxt('results-'+dataset_name+'/ours.v.txt', V, delimiter=',')
+                    np.savetxt('results-'+dataset_name+'/ours.vb.txt', Vb, delimiter=',')
                     numtest = 1000
                     testids = np.random.permutation(list(set(ratings.val['user_id'])))[:numtest]
                     predictions = np.matmul(U[testids], np.transpose(V)) + np.transpose(Vb)
