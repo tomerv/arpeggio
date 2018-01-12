@@ -7,6 +7,7 @@ if [ "$#" -ne 1 ]; then
     exit 1
 fi
 
+DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 
 #######
 # Generate dataset
@@ -14,7 +15,7 @@ fi
 
 DATASET_NAME=$1
 echo "DATASET: $DATASET_NAME"
-# python3 ${DATASET_NAME}.py
+python3 ${DATASET_NAME}.py
 
 #######
 # Run models
@@ -74,7 +75,6 @@ python3 ours2.py $DATASET_NAME
 python3 calc_scores.py ${DATASET_NAME} $MODEL_NAME
 date
 
-exit 0 #TODO
 
 function train_matlab_model {
     DATASET_NAME=$1
@@ -100,7 +100,7 @@ function train_matlab_model {
 MODEL_NAME='climf'
 date
 echo "MODEL: $MODEL_NAME"
-train_matlab_model ${DATASET_NAME} ${MODEL_NAME} '/home/tvromen/research/CLiMF_code' 'climf'
+train_matlab_model ${DATASET_NAME} ${MODEL_NAME} "${DIR}/CLiMF" 'climf'
 python3 calc_scores.py ${DATASET_NAME} $MODEL_NAME
 date
 
@@ -112,9 +112,10 @@ date
 MODEL_NAME='uoccf'
 date
 echo "MODEL: $MODEL_NAME"
-train_matlab_model ${DATASET_NAME} ${MODEL_NAME} '/home/tvromen/research/CLiMF_code' 'uoccf'
+train_matlab_model ${DATASET_NAME} ${MODEL_NAME} "${DIR}/CLiMF" 'uoccf'
 python3 calc_scores.py ${DATASET_NAME} $MODEL_NAME
 date
+
 
 #######
 # ListRank
@@ -123,7 +124,7 @@ date
 MODEL_NAME='listrank'
 date
 echo "MODEL: $MODEL_NAME"
-train_matlab_model ${DATASET_NAME} ${MODEL_NAME} '/home/tvromen/research/ListRank' '[U,V]=listrank(Traindata, 5, 0.01, 250, 1e-6)'
+train_matlab_model ${DATASET_NAME} ${MODEL_NAME} "${DIR}/ListRank" '[U,V]=listrank(Traindata, 5, 0.01, 250, 1e-6)'
 python3 calc_scores.py ${DATASET_NAME} $MODEL_NAME
 date
 
@@ -135,7 +136,7 @@ date
 MODEL_NAME='urm'
 date
 echo "MODEL: $MODEL_NAME"
-train_matlab_model ${DATASET_NAME} ${MODEL_NAME} '/home/tvromen/research/ListRank' '[U,V]=URM(Traindata, 5, 0.01, 250, 1e-6)'
+train_matlab_model ${DATASET_NAME} ${MODEL_NAME} "${DIR}/ListRank" '[U,V]=URM(Traindata, 5, 0.01, 250, 1e-6)'
 python3 calc_scores.py ${DATASET_NAME} $MODEL_NAME
 date
 
